@@ -1,38 +1,33 @@
 {
-	"push_hour": {
-		"type": "int",
-		"description": "每日推送时间（小时）",
-		"hint": "0-23，默认为 8（早上8点）",
-		"default": 8
-	},
-	"push_minute": {
-		"type": "int",
-		"description": "每日推送时间（分钟）",
-		"hint": "0-59，默认为 0",
-		"default": 0
-	},
-	"rss_poll_interval": {
-		"type": "int",
-		"description": "RSS 轮询间隔（秒）",
-		"hint": "当 RSS 尚未更新当日内容时，每隔多少秒重新检查一次，默认 600 秒（10分钟）",
-		"default": 600
-	},
-	"enable_ai_summary": {
-		"type": "bool",
-		"description": "是否开启 AI 总结",
-		"hint": "开启后，将调用配置的大模型对早报内容进行总结提炼。关闭则直接推送原文摘要。",
-		"default": true
-	},
-	"subscribed_groups": {
-		"type": "text",
-		"description": "订阅推送的群聊列表（每行一个）",
-		"hint": "支持跨平台格式 {机器人名称}:{群聊ID}。如果不加前缀仅填纯数字，默认为 QQ 群号。也可通过群内发送 /ainews_sub 指令订阅。",
-		"default": ""
-	},
-	"subscribed_users": {
-		"type": "text",
-		"description": "订阅推送的私聊列表（每行一个）",
-		"hint": "支持跨平台格式 {机器人名称}:{私聊账号ID}。如果不加前缀仅填纯数字，默认为私聊 QQ 号。也可通过私聊发送 /ainews_sub 指令订阅。",
-		"default": ""
-	}
+  "rss_urls": {
+    "description": "RSS 订阅地址列表",
+    "type": "list",
+    "hint": "每行一个 RSS 地址"
+  },
+  "schedule_cron": {
+    "description": "定时任务 Cron 表达式",
+    "type": "string",
+    "default": "30 9 * * *",
+    "hint": "默认每天早上 9 点 30 分执行"
+  },
+  "target_groups": {
+    "description": "目标群组/会话列表",
+    "type": "list",
+    "hint": "新闻播报发送的目标会话 umo"
+  },
+  "llm_request_umo": {
+    "description": "用于请求LLM的会话umo",
+    "type": "string",
+    "hint": "用于新闻播报总结的会话 umo"
+  },
+  "max_news_count": {
+    "description": "每次获取的最大新闻数量",
+    "type": "int",
+    "default": 10
+  },
+  "enable_auto_send": {
+    "description": "是否启用自动发送",
+    "type": "bool",
+    "default": false
+  }
 }
