@@ -29,5 +29,11 @@
     "description": "是否启用自动发送",
     "type": "bool",
     "default": false
+  },
+  "skill_content": {
+    "description": "消息模板前置内容",
+    "type": "string",
+    "default": "",
+    "hint": "在 WebUI 中输入需要插入到推送消息前部的文本内容"
   }
 }

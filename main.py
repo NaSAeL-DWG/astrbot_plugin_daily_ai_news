@@ -1,14 +1,10 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
 import tempfile
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from email.utils import parsedate_to_datetime
-from typing import Dict, Optional, Set
 
-import aiohttp
 import atoma
 import httpx
 from bs4 import BeautifulSoup
@@ -16,9 +12,6 @@ from bs4 import BeautifulSoup
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
-
-# RSS 订阅源配置
-RSS_URL = "https://imjuya.github.io/juya-ai-daily/rss.xml"
 
 # AI 总结 prompt
 SUMMARY_PROMPT = """你是一个专业的 AI 资讯编辑。请将以下 AI 早报内容进行精炼总结，要求：
@@ -45,7 +38,7 @@ class DailyAINewsPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self.context = context
         self._url_list = config["rss_urls"]
         self._num = int(config["max_news_count"])
@@ -53,7 +46,8 @@ class DailyAINewsPlugin(Star):
         self._schedule_cron = config["schedule_cron"]
         self._llm_request_umo = config["llm_request_umo"]
         self._enable_auto_send = config.get("enable_auto_send", False)
-        self._scheduled_job_id: Optional[str] = None
+        self._skill_content = str(config.get("skill_content", "")).strip()
+        self._scheduled_job_id: str | None = None
 
         # 使用框架规范的数据目录
         self._data_dir = StarTools.get_data_dir("astrbot_plugin_daily_ai_news")
@@ -62,10 +56,8 @@ class DailyAINewsPlugin(Star):
         self._cache_file = self._data_dir / "summary_cache.json"
 
         # 通过指令订阅的 unified_msg_origin 集合
-        self._cmd_subscriptions: Set[str] = set()
-        # 已推送的日期和链接（分离存储）
-        self._sent_dates: Set[str] = set()
-        self._sent_links: Set[str] = set()
+        self._cmd_subscriptions: set[str] = set()
+        self._sent_keys: set[str] = set()
 
         # 文件读写互斥锁
         self._file_lock = asyncio.Lock()
@@ -85,28 +77,15 @@ class DailyAINewsPlugin(Star):
     async def cmd_ainews(self, event: AstrMessageEvent):
         """手动获取最新 AI 早报"""
         yield event.plain_result("🔄 正在从 RSS 获取最新 AI 早报，请稍候...")
-        article = await self._fetch_rss_latest()
-        if not article:
+        batch = await self._fetch_rss_batch()
+        if not batch:
             yield event.plain_result("😞 暂时未能获取到 AI 早报，请稍后再试。")
             return
 
-        # 使用文章实际日期作为缓存 key，而非当天日期
-        article_date = self._parse_article_date(article)
-
-        # 检查缓存
-        cache = await self._read_summary_cache()
-        cached = cache.get(article_date)
-        if cached:
-            logger.info(f"使用缓存的 AI 总结 ({article_date})")
-            text = self._format_summary(
-                cached["title"], cached["url"], cached["summary"], article_date
-            )
-            yield event.plain_result(text)
-            return
-
-        text = await self._get_or_create_summary(article, article_date)
+        news_key = self._build_news_key(batch)
+        text = await self._get_or_create_summary(batch, news_key)
         if not text:
-            yield event.plain_result("😞 AI 总结失败，请稍后再试。")
+            logger.error("AI 总结失败，跳过手动输出")
             return
         yield event.plain_result(text)
 
@@ -139,25 +118,15 @@ class DailyAINewsPlugin(Star):
     @filter.command("ainews_status")
     async def cmd_status(self, event: AstrMessageEvent):
         """查看推送状态"""
-        cmd_sub_count = len(self._cmd_subscriptions)
-        cfg_groups = self._get_config_groups()
-        cfg_group_count = len(cfg_groups)
-        cfg_users = self._get_config_users()
-        cfg_user_count = len(cfg_users)
-
-        ai_enabled = (
-            "已启用" if self.config.get("enable_ai_summary", True) else "已关闭"
-        )
+        cache = await self._read_summary_cache()
         status_text = (
-            "📊 **每日AI资讯推送状态**\n"
-            f"📡 数据源：RSS 订阅（橘鸦 AI 日报）\n"
+            "📊 每日AI资讯推送状态\n"
             f"⏰ Cron 表达式：{self._schedule_cron}\n"
-            f"🤖 AI 总结：{ai_enabled}\n"
-            f"📋 指令订阅数：{cmd_sub_count}\n"
-            f"📋 配置群聊数：{cfg_group_count}\n"
-            f"📋 配置私聊数：{cfg_user_count}\n"
-            f"📚 已推送日期缓存：{len(self._sent_dates)} 天\n"
-            f"📚 已推送文章缓存：{len(self._sent_links)} 篇"
+            f"🤖 自动发送：{'已启用' if self._enable_auto_send else '已关闭'}\n"
+            f"📋 指令订阅数：{len(self._cmd_subscriptions)}\n"
+            f"📨 配置目标数：{len(self._target_groups)}\n"
+            f"🧾 已发送内容键数：{len(self._sent_keys)}\n"
+            f"💾 总结缓存数：{len(cache)}"
         )
         yield event.plain_result(status_text)
 
@@ -181,55 +150,30 @@ class DailyAINewsPlugin(Star):
 
     async def run_daily_news(self):
         """定时执行一次每日 AI 资讯播报。"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        if today in self._sent_dates:
-            logger.info(f"今日 ({today}) 已推送过，跳过定时播报")
+        await self._push_latest_news()
+
+    def _get_push_targets(self) -> list[str]:
+        return sorted(set(self._target_groups) | self._cmd_subscriptions)
+
+    async def _push_latest_news(self):
+        """抓取最新 RSS 聚合内容并推送到所有订阅目标。"""
+        batch = await self._fetch_rss_batch()
+        if not batch:
+            logger.info("No RSS batch available for push")
             return
 
-        await self._try_fetch_and_push(today)
+        news_key = self._build_news_key(batch)
+        if news_key in self._sent_keys:
+            logger.info(f"News batch already sent: {news_key}")
+            return
 
-    async def _try_fetch_and_push(self, today: str) -> bool:
-        """尝试从 RSS 获取当日文章并推送。返回 True 表示成功推送。"""
-        try:
-            article = await self._fetch_rss_latest()
-            if not article:
-                logger.info("RSS 获取失败或无文章")
-                return False
-
-            # 解析文章日期
-            article_date = self._parse_article_date(article)
-
-            # 检查是否是当日文章
-            if article_date != today:
-                logger.info(
-                    f"RSS 最新文章日期 ({article_date}) 不是今日 ({today})，继续等待"
-                )
-                return False
-
-            # 检查是否已推送过该文章（基于链接去重）
-            if article["link"] in self._sent_links:
-                logger.info(f"该文章已推送过：{article['link']}")
-                return False
-
-            # 获取 AI 总结并推送
-            await self._do_push(article, article_date)
-            return True
-
-        except Exception as e:
-            logger.error(f"尝试获取并推送失败: {e}")
-            return False
-
-    async def _do_push(self, article: Dict, article_date: str):
-        """执行一次新闻推送到所有订阅目标。"""
-        logger.info(f"开始执行每日AI资讯推送: {article['title']}")
-
-        text = await self._get_or_create_summary(article, article_date)
+        logger.info(f"开始执行每日AI资讯推送: {batch['title']}")
+        text = await self._get_or_create_summary(batch, news_key)
         if not text:
             logger.warning("未能生成 AI 总结，跳过本次推送")
             return
 
-        # 推送
-        targets = self.get_news_from_rss(self._url_list, self._num)
+        targets = self._get_push_targets()
         if not targets:
             logger.info("没有任何推送目标，跳过推送")
             return
@@ -244,16 +188,8 @@ class DailyAINewsPlugin(Star):
             except Exception as e:
                 logger.error(f"推送到 {umo} 失败: {e}")
 
-        # 仅在至少一个目标发送成功后才标记已推送
         if success_count > 0:
-            self._sent_dates.add(article_date)
-            self._sent_links.add(article["link"])
-            # 裁剪：日期保留最近 30 天，链接保留最近 100 条
-            if len(self._sent_dates) > 30:
-                sorted_dates = sorted(self._sent_dates)
-                self._sent_dates = set(sorted_dates[-30:])
-            if len(self._sent_links) > 100:
-                self._sent_links = set(list(self._sent_links)[-100:])
+            self._sent_keys.add(news_key)
             await self._save_sent_news()
             logger.info(
                 f"每日AI资讯推送完成，成功推送到 {success_count}/{len(targets)} 个目标"
@@ -262,149 +198,88 @@ class DailyAINewsPlugin(Star):
             logger.warning("所有推送目标均失败，不标记已推送，后续将重试")
 
     async def _get_or_create_summary(
-        self, article: Dict, article_date: str
-    ) -> Optional[str]:
-        """获取指定日期的 AI 总结，优先使用缓存。"""
-        # 检查是否开启 AI 总结
+        self, batch: dict[str, object], news_key: str
+    ) -> str | None:
+        """获取 RSS 聚合内容的 AI 总结，优先使用缓存。"""
         if not self.config.get("enable_ai_summary", True):
-            logger.info("未开启 AI 总结，直接使用原文摘要")
-            return self._format_fallback(article, article_date)
+            logger.warning("未开启 AI 总结，跳过内容输出")
+            return None
 
-        # 检查缓存
         cache = await self._read_summary_cache()
-        cached = cache.get(article_date)
+        cached = cache.get(news_key)
         if cached:
-            logger.info(f"使用缓存的 AI 总结 ({article_date})")
+            logger.info(f"使用缓存的 AI 总结 ({news_key})")
             return self._format_summary(
-                cached["title"], cached["url"], cached["summary"], article_date
+                cached["title"], cached["url"], cached["summary"]
             )
 
-        # 缓存未命中，进行 AI 总结
-        summary = await self._summarize_with_ai(article["content"])
+        summary = await self._summarize_with_ai(str(batch["content"]))
         if summary:
-            # 写入缓存
-            cache = await self._read_summary_cache()
-            cache[article_date] = {
-                "title": article["title"],
-                "url": article["link"],
+            cache[news_key] = {
+                "title": str(batch["title"]),
+                "url": str(batch.get("url", "")),
                 "summary": summary,
             }
             await self._save_summary_cache(cache)
             return self._format_summary(
-                article["title"], article["link"], summary, article_date
+                str(batch["title"]), str(batch.get("url", "")), summary
             )
-        else:
-            return self._format_fallback(article, article_date)
+
+        logger.error(f"AI 总结生成失败，跳过内容输出: {news_key}")
+        return None
 
     # ==================== RSS 获取 ====================
-    async def get_pure_text(self, html_str):
+    async def get_pure_text(self, html_str: str) -> str:
         if not html_str:
             return ""
         try:
             soup = BeautifulSoup(html_str, "html.parser")
             return soup.get_text(separator=" ", strip=True)
         except Exception as e:
-            logger.error(f"[RssTextNews] HTML 解析失败: {e}")
+            logger.error(f"[DailyAINews] HTML parse failed: {e}")
             return html_str
 
-    async def get_news_from_rss(self, _url_list: list, _num: int):
-        _news = ""
+    async def _fetch_rss_batch(self) -> dict[str, object] | None:
+        lines: list[str] = []
+        links: list[str] = []
+
         async with httpx.AsyncClient() as client:
-            for _url in _url_list:
+            for url in self._url_list:
                 try:
-                    _response = client.get(_url)
-                    feed = atoma.parse_rss_bytes(_response.content)
-                    for item in feed.items[:_num]:
-                        _news += f"标题: {item.title}\n"
-                        raw_html = item.description
-                        pure_text = await self.get_pure_text(raw_html)
-                        _news += f"正文摘要: {pure_text}\n"
+                    response = await client.get(url)
+                    feed = atoma.parse_rss_bytes(response.content)
+                    for item in feed.items[: self._num]:
+                        lines.append(f"标题: {item.title}")
+                        pure_text = await self.get_pure_text(item.description)
+                        lines.append(f"正文摘要: {pure_text}")
+                        if getattr(item, "link", None):
+                            links.append(item.link)
                 except Exception as e:
-                    logger.error(f"[RssTextNews] 访问源 " + _news + f" 时发送错误：{e}")
-        return _news
+                    logger.error(f"[DailyAINews] Failed to fetch RSS from {url}: {e}")
 
-    # TODO:废弃该函数
-    async def _fetch_rss_latest(self) -> Optional[Dict]:
-        """从 RSS 订阅源获取最新一篇文章。"""
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (compatible; AstrBot/3.0; +https://github.com/AstrBot)",
-                "Accept": "application/rss+xml, application/xml, text/xml, */*",
-            }
+        if not lines:
+            return None
 
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as session:
-                async with session.get(RSS_URL, headers=headers) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"RSS 请求返回状态码 {resp.status}")
-                        return None
+        primary_link = links[0] if links else ""
+        primary_title = lines[0].removeprefix("标题: ") if lines else "AI News"
+        return {
+            "title": primary_title,
+            "content": "\n".join(lines),
+            "links": links,
+            "url": primary_link,
+        }
 
-                    xml_text = await resp.text()
+    def _build_news_key(self, batch: dict[str, object]) -> str:
+        links = [link for link in batch.get("links", []) if link]
+        if links:
+            return "|".join(links)
 
-            # 解析 RSS XML
-            root = ET.fromstring(xml_text)
-            channel = root.find("channel")
-            if channel is None:
-                logger.warning("RSS XML 中未找到 channel 元素")
-                return None
-
-            # 获取第一个 item（最新文章）
-            item = channel.find("item")
-            if item is None:
-                logger.warning("RSS 中没有任何文章")
-                return None
-
-            title = item.findtext("title", "").strip()
-            link = item.findtext("link", "").strip()
-            description = item.findtext("description", "").strip()
-            pub_date = item.findtext("pubDate", "").strip()
-
-            if not title:
-                logger.warning("RSS 文章标题为空")
-                return None
-
-            # 清理 HTML（description 可能包含 HTML 标签）
-            content = self._clean_html(description)
-
-            logger.info(f"RSS 获取到最新文章：{title}")
-            return {
-                "title": title,
-                "link": link,
-                "content": content,
-                "pub_date": pub_date,
-            }
-
-        except ET.ParseError as e:
-            logger.error(f"RSS XML 解析失败: {e}")
-        except Exception as e:
-            logger.error(f"RSS 获取失败: {type(e).__name__}: {e!r}")
-
-        return None
-
-    def _parse_article_date(self, article: Dict) -> str:
-        """从文章中解析日期，优先使用 pubDate，回退从标题提取，最后使用当天日期。"""
-        # 优先：解析 pubDate（RFC 2822 格式）
-        pub_date = article.get("pub_date", "")
-        if pub_date:
-            try:
-                dt = parsedate_to_datetime(pub_date)
-                return dt.strftime("%Y-%m-%d")
-            except Exception:
-                pass
-
-        # 回退：从标题提取 YYYY-MM-DD
-        title = article.get("title", "")
-        match = re.search(r"(\d{4}-\d{2}-\d{2})", title)
-        if match:
-            return match.group(1)
-
-        # 最后回退：当天日期
-        return datetime.now().strftime("%Y-%m-%d")
+        content = str(batch.get("content", ""))
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     # ==================== AI 总结 ====================
 
-    async def _summarize_with_ai(self, content: str) -> Optional[str]:
+    async def _summarize_with_ai(self, content: str) -> str | None:
         """使用 AstrBot 内置 LLM 对内容进行总结。"""
         if not content or len(content.strip()) < 50:
             logger.warning("文章内容过短，跳过 AI 总结")
@@ -441,34 +316,18 @@ class DailyAINewsPlugin(Star):
 
     # ==================== 格式化输出 ====================
 
-    def _format_summary(
-        self, title: str, url: str, summary: str, article_date: str
-    ) -> str:
+    def _format_summary(self, title: str, url: str, summary: str) -> str:
         """格式化 AI 总结后的推送文本。"""
+        prefix = f"{self._skill_content}\n\n" if self._skill_content else ""
         return (
-            f"📰 AI 早报速递 | {article_date}\n"
+            "📰 AI 早报速递\n"
             f"{'=' * 28}\n\n"
+            f"{prefix}"
             f"📌 原文：{title}\n\n"
             f"🤖 AI 总结：\n\n"
             f"{summary}\n\n"
             f"{'=' * 28}\n"
             f"🔗 原文链接：{url}\n"
-            f"💡 发送 /ainews 随时获取最新资讯"
-        )
-
-    def _format_fallback(self, article: Dict, article_date: str) -> str:
-        """当 AI 总结失败时，使用原文摘要。"""
-        content = article.get("content", "")
-        if len(content) > 500:
-            content = content[:500] + "..."
-
-        return (
-            f"📰 AI 早报 | {article_date}\n"
-            f"{'=' * 28}\n\n"
-            f"📌 {article['title']}\n\n"
-            f"{content}\n\n"
-            f"{'=' * 28}\n"
-            f"🔗 原文链接：{article.get('link', '')}\n"
             f"💡 发送 /ainews 随时获取最新资讯"
         )
 
@@ -500,7 +359,7 @@ class DailyAINewsPlugin(Star):
             try:
                 filepath = str(self._subscriptions_file)
                 if os.path.exists(filepath):
-                    with open(filepath, "r", encoding="utf-8") as f:
+                    with open(filepath, encoding="utf-8") as f:
                         data = json.load(f)
                     self._cmd_subscriptions = set(data.get("subscriptions", []))
                     logger.info(f"已加载 {len(self._cmd_subscriptions)} 个指令订阅")
@@ -522,31 +381,23 @@ class DailyAINewsPlugin(Star):
     async def _load_sent_news(self):
         """加载已推送记录。"""
         async with self._file_lock:
+            self._sent_keys = set()
             try:
                 filepath = str(self._sent_file)
                 if os.path.exists(filepath):
-                    with open(filepath, "r", encoding="utf-8") as f:
+                    with open(filepath, encoding="utf-8") as f:
                         data = json.load(f)
-                    # 兼容旧格式：如果是旧的 sent_ids 格式，自动迁移
-                    if "sent_ids" in data:
-                        old_ids = set(data.get("sent_ids", []))
-                        for item in old_ids:
-                            if re.match(r"\d{4}-\d{2}-\d{2}$", item):
-                                self._sent_dates.add(item)
-                            else:
-                                self._sent_links.add(item)
-                        logger.info("已从旧格式迁移已推送记录")
-                    else:
-                        self._sent_dates = set(data.get("sent_dates", []))
-                        self._sent_links = set(data.get("sent_links", []))
-                    logger.info(
-                        f"已加载 {len(self._sent_dates)} 个已推送日期，"
-                        f"{len(self._sent_links)} 个已推送链接"
+                    self._sent_keys.update(data.get("sent_keys", []))
+                    self._sent_keys.update(data.get("sent_links", []))
+                    self._sent_keys.update(
+                        item
+                        for item in data.get("sent_ids", [])
+                        if not re.match(r"\d{4}-\d{2}-\d{2}$", item)
                     )
+                    logger.info(f"已加载 {len(self._sent_keys)} 个已发送内容键")
             except Exception as e:
                 logger.error(f"加载已推送记录失败: {e}")
-                self._sent_dates = set()
-                self._sent_links = set()
+                self._sent_keys = set()
 
     async def _save_sent_news(self):
         """保存已推送记录。"""
@@ -554,27 +405,24 @@ class DailyAINewsPlugin(Star):
             try:
                 self._atomic_write(
                     self._sent_file,
-                    {
-                        "sent_dates": sorted(self._sent_dates),
-                        "sent_links": list(self._sent_links),
-                    },
+                    {"sent_keys": sorted(self._sent_keys)},
                 )
             except Exception as e:
                 logger.error(f"保存已推送记录失败: {e}")
 
-    async def _read_summary_cache(self) -> Dict[str, Dict]:
+    async def _read_summary_cache(self) -> dict[str, dict]:
         """从文件读取 AI 总结缓存。"""
         async with self._file_lock:
             try:
                 filepath = str(self._cache_file)
                 if os.path.exists(filepath):
-                    with open(filepath, "r", encoding="utf-8") as f:
+                    with open(filepath, encoding="utf-8") as f:
                         return json.load(f)
             except Exception as e:
                 logger.error(f"读取总结缓存失败: {e}")
             return {}
 
-    async def _save_summary_cache(self, cache: Dict[str, Dict]):
+    async def _save_summary_cache(self, cache: dict[str, dict]):
         """保存 AI 总结缓存到文件。"""
         async with self._file_lock:
             try:
