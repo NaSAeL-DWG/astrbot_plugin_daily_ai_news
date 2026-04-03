@@ -27,8 +27,8 @@ DEFAULT_NEWS_PROMPT = """你是一个专业的 AI 新闻播报编辑。请根据
 
 请直接输出播报正文："""
 
-MAX_CACHE_SIZE = 10
-MAX_GENERATION_CONTENT_LENGTH = 8000
+MAX_CACHE_SIZE = 100
+MAX_GENERATION_CONTENT_LENGTH = 80000
 
 
 @register(
@@ -197,6 +197,7 @@ class DailyAINewsPlugin(Star):
                                 "link": link,
                             }
                         )
+                        logger.debug(f"[DailyAINews] 成功获取新闻 {title}")
                 except Exception as exc:
                     logger.error(f"[DailyAINews] Failed to fetch RSS from {url}: {exc}")
 
