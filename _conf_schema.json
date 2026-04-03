@@ -13,12 +13,30 @@
   "target_groups": {
     "description": "目标群组/会话列表",
     "type": "list",
-    "hint": "新闻播报发送的目标会话 umo"
+    "hint": "自动推送新闻时发送的目标会话 umo"
   },
-  "llm_request_umo": {
-    "description": "用于请求LLM的会话umo",
+  "generate_news_umo": {
+    "description": "生成新闻正文时使用的会话 umo",
     "type": "string",
-    "hint": "用于新闻播报总结的会话 umo"
+    "hint": "仅用于解析生成新闻内容所使用的模型"
+  },
+  "push_umo": {
+    "description": "推送阶段使用的会话 umo",
+    "type": "string",
+    "default": "",
+    "hint": "仅用于推送阶段语义配置；当前发送仍以目标会话 umo 为准"
+  },
+  "news_prompt": {
+    "description": "自定义新闻生成提示词",
+    "type": "string",
+    "default": "",
+    "hint": "为空时使用插件内置默认提示词；可用 {content} 引用原始新闻文本"
+  },
+  "wrapper_text": {
+    "description": "附加到 AI 新闻正文后的包装文本",
+    "type": "string",
+    "default": "",
+    "hint": "会以空行分隔后追加到 AI 生成正文末尾"
   },
   "max_news_count": {
     "description": "每次获取的最大新闻数量",
@@ -28,12 +46,7 @@
   "enable_auto_send": {
     "description": "是否启用自动发送",
     "type": "bool",
-    "default": false
-  },
-  "skill_content": {
-    "description": "消息模板前置内容",
-    "type": "string",
-    "default": "",
-    "hint": "在 WebUI 中输入需要插入到推送消息前部的文本内容"
+    "default": false,
+    "hint": "关闭时不注册定时推送，但仍可使用 /ainews 手动预览"
   }
 }

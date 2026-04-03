@@ -1,26 +1,23 @@
 # astrbot_plugin_daily_ai_news
 
-每日 AI 资讯自动推送插件 - 为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 开发
+每日 AI 资讯自动推送插件 - 为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 开发。
 
-通过 RSS 订阅 [橘鸦 AI 日报](https://imjuya.github.io/juya-ai-daily/) 获取最新 AI 早报，经 **AI 总结** 后自动推送到 QQ 群 / 私聊。
+该插件会抓取 RSS 新闻，生成一份 AI 新闻播报正文，并按计划发送到指定目标会话。
 
 ## ✨ 功能
 
-- 📰 **定时自动推送**：使用 `schedule_cron` 通过 `cron_manager` 定时触发每日 AI 资讯推送
-- 🤖 **AI 智能总结**：调用 AstrBot 内置 LLM，将长篇早报精炼为 5-8 条关键要点
-- 🔄 **手动获取**：发送 `/ainews` 随时获取最新 AI 资讯
-- 📋 **灵活订阅**：支持配置文件填写群号/QQ号 + 群内指令订阅两种方式
-- 🧹 **RSS 文本清洗**：沿用 `astrbot_plugin_dailytextnews` 的 RSS 获取与 HTML 清洗方式
-- 💾 **缓存去重**：AI 总结结果缓存到本地，并按 RSS 内容键去重推送
+- 📰 **简化的 RSS → AI 新闻正文流程**：核心抓取与生成逻辑参考 `dailytextnews`
+- 🤖 **生成与推送职责分离**：`generate_news_umo` 仅用于生成新闻，`push_umo` 仅保留为推送阶段配置语义
+- ⏰ **定时自动推送**：使用 `schedule_cron` 结合 `cron_manager` 执行每日播报
+- 💾 **缓存与去重**：保留本地生成缓存与已发送记录，避免重复生成与重复推送
+- 🔄 **手动预览**：发送 `/ainews` 即可立即预览本次新闻内容
+- 🧩 **可自定义提示词与包装文本**：提示词为空时走内置默认模板，包装文本追加在 AI 正文后
 
 ## 📝 指令列表
 
-| 指令             | 说明                              |
-| ---------------- | --------------------------------- |
-| `/ainews`        | 立即获取最新 AI 资讯（AI 总结版） |
-| `/ainews_sub`    | 订阅每日推送（群聊/私聊均可使用） |
-| `/ainews_unsub`  | 取消每日推送订阅                  |
-| `/ainews_status` | 查看推送状态与订阅信息            |
+| 指令 | 说明 |
+| --- | --- |
+| `/ainews` | 立即抓取并生成一份 AI 新闻预览，仅回复当前会话 |
 
 ## ⚙️ 配置说明
 
@@ -29,34 +26,44 @@
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
 | `rss_urls` | RSS 源地址列表，可配置一个或多个订阅源 | 空 |
-| `schedule_cron` | 使用 cron 表达式控制自动推送时间 | `0 9 * * *` |
-| `target_groups` | 需要推送的目标列表，可包含群聊或私聊目标 | 空 |
-| `llm_request_umo` | 用于请求 LLM 的统一消息来源 | 空 |
-| `max_news_count` | 每个 RSS 源最多抓取的新闻条数 | `5` |
+| `schedule_cron` | 使用 cron 表达式控制自动推送时间 | `30 9 * * *` |
+| `target_groups` | 自动推送的目标会话列表 | 空 |
+| `generate_news_umo` | 用于解析生成新闻模型的会话 umo | 空 |
+| `push_umo` | 推送阶段的会话 umo 语义配置 | 空 |
+| `news_prompt` | 自定义新闻生成提示词，支持 `{content}` 占位符 | 空 |
+| `wrapper_text` | 附加在 AI 正文后的包装文本 | 空 |
+| `max_news_count` | 每个 RSS 源最多抓取的新闻条数 | `10` |
 | `enable_auto_send` | 是否启用自动推送 | `false` |
-| `skill_content` | 通过 WebUI 输入的消息前置文本，会插入到最终推送消息顶部 | 空 |
+
+## 📌 行为说明
+
+- `generate_news_umo` **只用于生成新闻正文**。
+- `push_umo` **不参与新闻生成**；当前 AstrBot `send_message` API 仍按目标会话发送消息，因此该字段目前仅保留为推送阶段配置语义。
+- 最终推送文本格式为：`AI 正文 + 空行 + wrapper_text`。
+- 当 `wrapper_text` 为空时，仅发送 AI 正文。
+- `/ainews` 使用与定时任务相同的抓取、缓存、生成、渲染流程，但仅返回当前会话预览，不写入已推送记录。
+- 当 `enable_auto_send=false` 时，不注册定时推送，但 `/ainews` 仍可使用。
+
+## ❌ fallback 说明
+
+- RSS 获取失败：只返回/记录错误信息，不回退输出简要内容。
+- AI 生成失败：只返回/记录错误信息，不回退输出简要内容。
+- 定时任务失败：仅记录日志，不向目标会话发送失败提示。
+
+## 💾 持久化说明
+
+插件会继续使用原有数据目录保存：
+
+- `summary_cache.json`：缓存已生成的新闻正文（最多保留 10 条）
+- `sent_news.json`：记录已成功推送的新闻键值
+
+旧版缓存中若存在 `summary` 字段，插件会兼容读取。
 
 ## 📦 安装
 
 1. 在 AstrBot 管理面板中搜索 `astrbot_plugin_daily_ai_news` 安装
-2. 或手动将本仓库克隆到 `addons/plugins/` 目录下
+2. 或手动将本仓库克隆到 `data/plugins/` 目录下
 3. 重启 AstrBot 即可生效
-
-## 📌 注意事项
-
-- **需要配置 LLM**：AI 总结功能依赖 AstrBot 中已配置的 LLM Provider，请确保至少启用了一个 LLM 服务
-- 可通过 `skill_content` 在 WebUI 中直接输入固定文案，作为推送消息前置内容
-- 若 AI 总结失败，插件只会记录日志，不再回退输出原文内容
-- 插件仅依赖 `schedule_cron` 触发自动推送，不再执行启动补偿或轮询检查
-- 配置群号方式需要填写 QQ 群号码（纯数字），指令方式需在群内发送 `/ainews_sub`
-- 两种订阅方式（配置文件 + 指令）可同时使用，插件会自动合并去重
-- 相同 RSS 聚合内容不会重复推送，内容变化后会生成新的总结与推送
-- AI 总结缓存最多保留最近 10 条记录
-
-## 📝 更新日志
-
-- ✨ 新增了多平台的支持。
-- ⚙️ 新增了开启/关闭 AI 总结的选项支持。
 
 ## 📄 License
 
