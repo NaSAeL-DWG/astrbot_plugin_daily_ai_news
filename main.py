@@ -47,7 +47,7 @@ class DailyAINewsPlugin(Star):
         self._url_list = list(config.get("rss_urls", []))
         self._num = int(config.get("max_news_count", 10))
         self._target_groups = list(config.get("target_groups", []))
-        self._schedule_cron = str(config.get("schedule_cron", "30 9 * * *"))
+        self._schedule_cron = str(config.get("schedule_cron", "0 9 * * *"))
         self._enable_auto_send = bool(config.get("enable_auto_send", False))
         self._generate_news_umo = str(config.get("generate_news_umo", "")).strip()
         self._push_umo = str(config.get("push_umo", "")).strip()
@@ -90,11 +90,26 @@ class DailyAINewsPlugin(Star):
             logger.info("自动发送未启用，跳过定时任务注册")
             return
 
+        job_name = "daily_ai_news_broadcast"
+
+        existing_jobs = await self.context.cron_manager.list_jobs(job_type="basic")
+        duplicate_job_ids = {
+            str(job.job_id)
+            for job in existing_jobs
+            if getattr(job, "name", None) == job_name
+        }
+
         if self._scheduled_job_id:
-            return
+            duplicate_job_ids.add(self._scheduled_job_id)
+
+        for job_id in duplicate_job_ids:
+            await self.context.cron_manager.delete_job(job_id)
+            logger.info(f"删除已存在的重复定时任务: {job_id}")
+
+        self._scheduled_job_id = None
 
         job = await self.context.cron_manager.add_basic_job(
-            name="daily_ai_news_broadcast",
+            name=job_name,
             cron_expression=self._schedule_cron,
             handler=self.run_daily_news,
             description="每日 AI 资讯播报定时任务",
@@ -311,6 +326,7 @@ class DailyAINewsPlugin(Star):
                 chat_provider_id=provider_id,
                 prompt=prompt,
             )
+            logger.debug(f"[DailyAINews] 成功获取AI总结新闻")
         except Exception as exc:
             logger.error(f"AI 新闻生成失败: {exc}")
             return None
