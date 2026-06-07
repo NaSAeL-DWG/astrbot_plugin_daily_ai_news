@@ -1,1 +1,4 @@
 aiohttp
+atoma
+beautifulsoup4
+httpx

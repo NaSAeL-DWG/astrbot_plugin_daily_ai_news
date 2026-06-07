@@ -4,6 +4,12 @@
     "type": "list",
     "hint": "每行一个 RSS 地址"
   },
+  "festival_api_url":{
+    "description": "节日/纪念日 API 地址",
+    "type": "string",
+    "default": "https://timor.tech/api/holiday/info/",
+    "hint": "用于获取当天的节日/纪念日信息，支持在新闻提示词中引用"
+  },
   "schedule_cron": {
     "description": "定时任务 Cron 表达式",
     "type": "string",

@@ -1,6 +1,6 @@
 name: astrbot_plugin_daily_ai_news
 display_name: 每日AI资讯推送
 desc: 订阅RSS并进行AI总结
-version: 1.01
+version: 1.0.2
 author: NaSAeL
 repo: https://github.com/NaSAeL-DWG/astrbot_plugin_daily_ai_news

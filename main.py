@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import atoma
@@ -22,6 +23,9 @@ DEFAULT_NEWS_PROMPT = """你是一个专业的 AI 新闻播报编辑。请根据
 4. 保持内容准确，不要编造原文中不存在的信息。
 5. 仅输出最终播报正文，不要输出解释、标题前缀或额外说明。
 
+当日信息:
+{time}
+
 新闻原文：
 {content}
 
@@ -29,13 +33,30 @@ DEFAULT_NEWS_PROMPT = """你是一个专业的 AI 新闻播报编辑。请根据
 
 MAX_CACHE_SIZE = 100
 MAX_GENERATION_CONTENT_LENGTH = 80000
+RSS_FETCH_TIMEOUT = 15.0
+CACHE_TIMEZONE = timezone(timedelta(hours=8), "Asia/Shanghai")
+FESTIVAL_TYPE_NAMES = {
+    0: "工作日",
+    1: "周末",
+    2: "节日",
+    3: "调休",
+}
+WEEKDAY_NAMES = {
+    1: "周一",
+    2: "周二",
+    3: "周三",
+    4: "周四",
+    5: "周五",
+    6: "周六",
+    7: "周日",
+}
 
 
 @register(
     "astrbot_plugin_daily_ai_news",
     "NaSAeL",
     "订阅AI日报并进行AI总结 ",
-    "1.0.1",
+    "1.0.2",
     "https://github.com/NaSAeL-DWG/astrbot_plugin_daily_ai_news",
 )
 class DailyAINewsPlugin(Star):
@@ -61,6 +82,8 @@ class DailyAINewsPlugin(Star):
 
         self._sent_keys: set[str] = set()
         self._file_lock = asyncio.Lock()
+
+        self._festival_api_url = str(config.get("festival_api_url", "")).strip()
 
     async def initialize(self):
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -168,7 +191,11 @@ class DailyAINewsPlugin(Star):
             return None
 
         news_key = self._build_news_key(batch)
-        generated_text = await self._get_or_create_generated_text(batch, news_key)
+        festival_info = await self._fetch_festival_info()
+        generation_cache_key = self._build_generation_cache_key(batch, festival_info)
+        generated_text = await self._get_or_create_generated_text(
+            batch, generation_cache_key, festival_info
+        )
         if not generated_text:
             return None
 
@@ -191,7 +218,7 @@ class DailyAINewsPlugin(Star):
     async def _fetch_rss_batch(self) -> dict[str, object] | None:
         items: list[dict[str, str]] = []
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=RSS_FETCH_TIMEOUT) as client:
             for url in self._url_list:
                 try:
                     response = await client.get(url)
@@ -260,28 +287,56 @@ class DailyAINewsPlugin(Star):
         )
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
+    def _build_generation_cache_key(
+        self, batch: dict[str, object], festival_info: str
+    ) -> str:
+        prompt_template = self._news_prompt or DEFAULT_NEWS_PROMPT
+        cache_identity = {
+            "news_key": self._build_news_key(batch),
+            "prompt_template": prompt_template,
+            "festival_info": festival_info,
+            "cache_date": self._current_cache_date(),
+        }
+        cache_identity_text = json.dumps(
+            cache_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(cache_identity_text.encode("utf-8")).hexdigest()
+        return f"generated:{digest}"
+
     async def _get_or_create_generated_text(
-        self, batch: dict[str, object], news_key: str
+        self, batch: dict[str, object], cache_key: str, festival_info: str
     ) -> str | None:
         cache = await self._read_summary_cache()
-        cached = cache.get(news_key)
+        cached = cache.get(cache_key)
         cached_text = self._extract_cached_generated_text(cached)
         if cached_text:
-            logger.info(f"使用缓存的 AI 新闻内容 ({news_key})")
+            logger.info(f"使用缓存的 AI 新闻内容 ({cache_key})")
             return cached_text
 
-        generated_text = await self._generate_news_text(str(batch["content"]))
+        generated_text = await self._generate_news_text(
+            str(batch["content"]), festival_info
+        )
         if not generated_text:
-            logger.error(f"AI 新闻生成失败，跳过内容输出: {news_key}")
+            logger.error(f"AI 新闻生成失败，跳过内容输出: {cache_key}")
             return None
 
-        cache[news_key] = {
+        cache[cache_key] = {
             "title": str(batch.get("title", "")),
             "url": str(batch.get("url", "")),
             "generated_text": generated_text,
+            "created_at": self._current_cache_datetime().isoformat(),
         }
         await self._save_summary_cache(cache)
         return generated_text
+
+    def _current_cache_datetime(self) -> datetime:
+        return datetime.now(CACHE_TIMEZONE)
+
+    def _current_cache_date(self) -> str:
+        return self._current_cache_datetime().date().isoformat()
 
     def _extract_cached_generated_text(
         self, cached: dict[str, object] | None
@@ -299,7 +354,61 @@ class DailyAINewsPlugin(Star):
 
         return None
 
-    async def _generate_news_text(self, content: str) -> str | None:
+    async def _fetch_festival_info(self) -> str:
+        if not self._festival_api_url:
+            return ""
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(self._festival_api_url)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            logger.error(f"[DailyAINews] Failed to fetch festival info: {exc}")
+            return ""
+
+        if not isinstance(payload, dict):
+            logger.warning("[DailyAINews] Festival API returned non-object payload")
+            return ""
+
+        if payload.get("code") not in (0, "0", None):
+            logger.warning(f"[DailyAINews] Festival API returned error: {payload}")
+            return ""
+
+        normalized_payload = self._normalize_festival_payload(payload)
+        return json.dumps(normalized_payload, ensure_ascii=False)
+
+    def _normalize_festival_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        normalized_payload = dict(payload)
+
+        type_info = payload.get("type")
+        if isinstance(type_info, dict):
+            normalized_type = dict(type_info)
+            type_value = self._to_int(normalized_type.get("type"))
+            week_value = self._to_int(normalized_type.get("week"))
+            if type_value in FESTIVAL_TYPE_NAMES:
+                normalized_type["type"] = FESTIVAL_TYPE_NAMES[type_value]
+            if week_value in WEEKDAY_NAMES:
+                normalized_type["week"] = WEEKDAY_NAMES[week_value]
+            normalized_payload["type"] = normalized_type
+
+        holiday_info = payload.get("holiday")
+        if isinstance(holiday_info, dict):
+            normalized_payload["holiday"] = dict(holiday_info)
+
+        return normalized_payload
+
+    def _to_int(self, value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def _generate_news_text(
+        self, content: str, festival_info: str | None = None
+    ) -> str | None:
         if not content or len(content.strip()) < 50:
             logger.warning("文章内容过短，跳过 AI 新闻生成")
             return None
@@ -316,7 +425,13 @@ class DailyAINewsPlugin(Star):
                 + "\n...(内容过长已截断)"
             )
 
-        prompt = prompt_template.replace("{content}", trimmed_content)
+        if festival_info is None:
+            festival_info = await self._fetch_festival_info()
+        prompt = (
+            prompt_template.replace("{content}", trimmed_content).replace(
+                "{time}", festival_info
+            )
+        )
 
         try:
             provider_id = await self.context.get_current_chat_provider_id(
@@ -326,7 +441,7 @@ class DailyAINewsPlugin(Star):
                 chat_provider_id=provider_id,
                 prompt=prompt,
             )
-            logger.debug(f"[DailyAINews] 成功获取AI总结新闻")
+            logger.debug("[DailyAINews] 成功获取AI总结新闻")
         except Exception as exc:
             logger.error(f"AI 新闻生成失败: {exc}")
             return None
@@ -361,12 +476,26 @@ class DailyAINewsPlugin(Star):
                 temp_path.unlink(missing_ok=True)
             raise
 
+    def _replace_corrupt_json_file(self, filepath: Path, replacement: dict):
+        if filepath.exists():
+            timestamp = self._current_cache_datetime().strftime("%Y%m%d%H%M%S%f")
+            backup_path = filepath.with_name(f"{filepath.name}.corrupt.{timestamp}")
+            try:
+                filepath.replace(backup_path)
+                logger.warning(f"已备份损坏的 JSON 文件: {backup_path}")
+            except Exception as exc:
+                logger.error(f"备份损坏 JSON 文件失败 {filepath}: {exc}")
+
+        self._atomic_write(filepath, replacement)
+
     async def _load_sent_news(self):
         async with self._file_lock:
             self._sent_keys = set()
             try:
                 if self._sent_file.exists():
                     data = json.loads(self._sent_file.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        raise ValueError("sent news JSON root is not an object")
                     self._sent_keys.update(data.get("sent_keys", []))
                     self._sent_keys.update(data.get("sent_links", []))
                     self._sent_keys.update(
@@ -378,6 +507,7 @@ class DailyAINewsPlugin(Star):
             except Exception as exc:
                 logger.error(f"加载已推送记录失败: {exc}")
                 self._sent_keys = set()
+                self._replace_corrupt_json_file(self._sent_file, {"sent_keys": []})
 
     async def _save_sent_news(self):
         async with self._file_lock:
@@ -393,20 +523,44 @@ class DailyAINewsPlugin(Star):
         async with self._file_lock:
             try:
                 if self._cache_file.exists():
-                    return json.loads(self._cache_file.read_text(encoding="utf-8"))
+                    data = json.loads(self._cache_file.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        raise ValueError("summary cache JSON root is not an object")
+                    return data
             except Exception as exc:
                 logger.error(f"读取总结缓存失败: {exc}")
+                self._replace_corrupt_json_file(self._cache_file, {})
             return {}
 
     async def _save_summary_cache(self, cache: dict[str, dict]):
         async with self._file_lock:
             try:
                 if len(cache) > MAX_CACHE_SIZE:
-                    sorted_keys = sorted(cache.keys())
-                    cache = {key: cache[key] for key in sorted_keys[-MAX_CACHE_SIZE:]}
+                    sorted_items = sorted(
+                        cache.items(),
+                        key=lambda item: (self._cache_created_at(item[1]), item[0]),
+                    )
+                    cache = dict(sorted_items[-MAX_CACHE_SIZE:])
                 self._atomic_write(self._cache_file, cache)
             except Exception as exc:
                 logger.error(f"保存总结缓存失败: {exc}")
+
+    def _cache_created_at(self, cached: object) -> datetime:
+        if not isinstance(cached, dict):
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+        created_at = cached.get("created_at")
+        if not isinstance(created_at, str) or not created_at.strip():
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+        try:
+            parsed = datetime.fromisoformat(created_at)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=CACHE_TIMEZONE)
+        return parsed
 
     async def terminate(self):
         if self._scheduled_job_id:
