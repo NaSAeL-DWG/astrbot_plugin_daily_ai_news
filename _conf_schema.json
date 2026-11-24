@@ -40,9 +40,9 @@
   },
   "wrapper_text": {
     "description": "附加到 AI 新闻正文后的包装文本",
-    "type": "string",
+    "type": "text",
     "default": "",
-    "hint": "会以空行分隔后追加到 AI 生成正文末尾"
+    "hint": "支持多行输入，会以空行分隔后追加到 AI 生成正文末尾"
   },
   "max_news_count": {
     "description": "每次获取的最大新闻数量",
